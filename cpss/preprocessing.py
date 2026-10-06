@@ -3,11 +3,15 @@
 Two-stage pipeline:
 
     Global stage (cohort-wide, run once):
-        1. Missing-value filter (drop features with too many NaNs).
+        1. Missing-value filter (drop features with too many NaNs), either
+           across all samples or, with ``missing_filter: per_group``, keeping
+           features that pass in at least one group.
         2. Optional log2(x+1) transform.
 
     Local stage (per training subsample or per CV fold):
-        3. Imputation (minimum / knn / sklearn SimpleImputer strategy).
+        3. Imputation (minimum / min_prob / knn / sklearn SimpleImputer
+           strategy). A feature with no observed values in the subsample is
+           set to a constant, so it is carried through but cannot be selected.
         4. Per-feature z-score scaling.
 
 The split exists because the Shah & Samworth (2013) stability-selection bound
@@ -48,11 +52,15 @@ class Preprocessor:
     leakage-free stability selection).
     """
 
-    def __init__(self, config, verbose=True):
+    def __init__(self, config, verbose=True, seed=None):
         self.config = config
         self.max_missing = config.MAX_MISSING
         self.log_transform = config.LOG_TRANSFORM
+        self.missing_filter = getattr(config, 'MISSING_FILTER', 'overall')
         self.verbose = verbose
+        # Seed for 'min_prob' draws. Stability selection passes a distinct
+        # seed per subsample so each one gets its own imputation noise.
+        self.seed = seed if seed is not None else getattr(config, 'RANDOM_STATE', None)
 
         # Global-stage state
         self.features_after_missing = None
@@ -64,6 +72,8 @@ class Preprocessor:
         self.imputer = None
         self.scaler = None
         self.min_values = None  # for custom "minimum" strategy
+        self.minprob_mean = None  # for "min_prob" strategy
+        self.minprob_sd = None
 
     def fit_transform_global(self, X, y=None):
         """Fit and apply the global stage (missing filter + log).
@@ -74,14 +84,25 @@ class Preprocessor:
         """
         n_features_initial = X.shape[1]
 
-        missing_fraction = X.isnull().mean()
-        self.features_after_missing = X.columns[missing_fraction <= self.max_missing].tolist()
+        if self.missing_filter == 'per_group':
+            if y is None:
+                raise ValueError("missing_filter='per_group' requires labels y")
+            y_arr = np.asarray(y)
+            keep = np.zeros(X.shape[1], dtype=bool)
+            for group in np.unique(y_arr):
+                group_missing = X.loc[y_arr == group].isnull().mean()
+                keep |= (group_missing <= self.max_missing).values
+            filter_desc = "in every group"
+        else:
+            keep = (X.isnull().mean() <= self.max_missing).values
+            filter_desc = "overall"
+        self.features_after_missing = X.columns[keep].tolist()
         X = X[self.features_after_missing]
         n_features_after_missing = X.shape[1]
         if self.verbose:
             print(
                 f"    Removed {n_features_initial - n_features_after_missing} features "
-                f"with >{self.max_missing*100:.0f}% missing values "
+                f"with >{self.max_missing*100:.0f}% missing values {filter_desc} "
                 f"({n_features_after_missing} remaining)"
             )
 
@@ -156,13 +177,27 @@ class Preprocessor:
     def _fit_imputer(self, X):
         strategy = self.config.IMPUTATION_STRATEGY
         if strategy == "minimum":
-            self.min_values = X.min(axis=0)
-            X_imputed = X.fillna(self.min_values)
-            return pd.DataFrame(X_imputed, columns=X.columns, index=X.index)
+            # All-missing features have no minimum; fill them with 0.
+            self.min_values = X.min(axis=0).fillna(0.0)
+            return self._apply_imputer(X)
+        if strategy == "min_prob":
+            mean = X.mean(axis=0)
+            sd = X.std(axis=0)
+            # A feature with one observed value borrows the median SD; one
+            # with none is imputed as a constant (SD 0).
+            sd = sd.fillna(sd.median()).fillna(0.0)
+            sd[mean.isna()] = 0.0
+            self.minprob_mean = (mean - self.config.MINPROB_DOWNSHIFT * sd).fillna(0.0)
+            self.minprob_sd = self.config.MINPROB_WIDTH * sd
+            return self._apply_imputer(X)
+        # keep_empty_features: all-missing features are kept (filled with 0)
+        # rather than silently dropped, which would misalign the columns.
         if strategy == "knn":
-            self.imputer = KNNImputer(n_neighbors=self.config.KNN_NEIGHBORS)
+            self.imputer = KNNImputer(
+                n_neighbors=self.config.KNN_NEIGHBORS, keep_empty_features=True
+            )
         else:
-            self.imputer = SimpleImputer(strategy=strategy)
+            self.imputer = SimpleImputer(strategy=strategy, keep_empty_features=True)
         return pd.DataFrame(
             self.imputer.fit_transform(X), columns=X.columns, index=X.index
         )
@@ -172,6 +207,13 @@ class Preprocessor:
         if strategy == "minimum":
             X_imputed = X.fillna(self.min_values)
             return pd.DataFrame(X_imputed, columns=X.columns, index=X.index)
+        if strategy == "min_prob":
+            rng = np.random.default_rng(self.seed)
+            draws = pd.DataFrame(
+                rng.normal(size=X.shape) * self.minprob_sd.values + self.minprob_mean.values,
+                columns=X.columns, index=X.index,
+            )
+            return X.where(X.notna(), draws)
         return pd.DataFrame(
             self.imputer.transform(X), columns=X.columns, index=X.index
         )

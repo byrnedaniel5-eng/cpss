@@ -149,7 +149,11 @@ def main():
     if threshold_info:
         print(f"  M&B threshold:       π = {threshold_info.get('mb_threshold', 'N/A'):.4f}")
         print(f"  Threshold reduction: Δπ = {threshold_info.get('threshold_reduction', 0):.4f}")
-    print(f"  C_ref = {c_ref:.2e}")
+    print(f"  Median per-subsample C = {c_ref:.2e}")
+    if 'mean_selected_per_subsample' in threshold_info:
+        print(f"  Selected per subsample: mean "
+              f"{threshold_info['mean_selected_per_subsample']:.1f} "
+              f"(q = {config.MAX_CANDIDATES})")
     print(f"  Total stable: {len(sorted_stable)}")
 
     for i, feat in enumerate(sorted_stable[:20], 1):

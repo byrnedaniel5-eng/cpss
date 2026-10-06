@@ -23,6 +23,7 @@ REQUIRED_CSV_COLUMNS = {
     'feature_index', 'gene', 'protein_group', 'protein_names',
     'selection_probability', 'cohens_d', 'direction',
     'n_case', 'n_control', 'imputation_rate',
+    'imputation_rate_case', 'imputation_rate_control',
 }
 
 REQUIRED_MANIFEST_KEYS = {
@@ -102,12 +103,16 @@ def test_end_to_end_outputs_match_schema(tmp_path, base_config_dict):
     missing = REQUIRED_CSV_COLUMNS - set(df.columns)
     assert not missing, f"stable_features CSV missing columns: {missing}"
 
-    # n_case + n_control should be <= total sample count
-    assert (df['n_case'] >= 0).all()
-    assert (df['n_control'] >= 0).all()
+    # imputation rates are fractions
+    for col in ('imputation_rate', 'imputation_rate_case', 'imputation_rate_control'):
+        assert ((df[col] >= 0) & (df[col] <= 1)).all()
 
-    # imputation_rate is a fraction
-    assert ((df['imputation_rate'] >= 0) & (df['imputation_rate'] <= 1)).all()
+    # n_case / n_control count observed (non-imputed) samples, so they must
+    # equal each group's size times its observed fraction
+    total_case = int(np.sum(y == 1))
+    total_control = int(np.sum(y == 0))
+    np.testing.assert_allclose(df['n_case'], total_case * (1 - df['imputation_rate_case']))
+    np.testing.assert_allclose(df['n_control'], total_control * (1 - df['imputation_rate_control']))
 
     # direction is one of the four allowed values
     assert set(df['direction'].unique()).issubset({'up_case', 'up_control', 'zero', 'undetermined'})

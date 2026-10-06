@@ -31,6 +31,65 @@ from . import __version__ as PKG_VERSION
 from .diann_log import find_diann_log, parse_diann_log
 
 
+# Per-protein annotation columns DIA-NN writes at the start of a pg_matrix.
+# The set varies by version (1.8 has five; 1.9+ adds N.Sequences and
+# N.Proteotypic.Sequences), so they are detected by name, not by count.
+DIANN_PG_METADATA_COLUMNS = frozenset({
+    'Protein.Group',
+    'Protein.Ids',
+    'Protein.Names',
+    'Genes',
+    'First.Protein.Description',
+    'N.Sequences',
+    'N.Proteotypic.Sequences',
+})
+
+
+def _read_matrix(path) -> pd.DataFrame:
+    """Read a DIA-NN matrix, choosing the parser from the file extension.
+
+    DIA-NN writes tab-separated ``.tsv`` by default and ``.parquet`` in 2.x;
+    comma-separated ``.csv`` is accepted for matrices re-saved elsewhere.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix == '.parquet':
+        try:
+            return pd.read_parquet(path)
+        except ImportError as exc:
+            raise ImportError(
+                "Reading .parquet input requires pyarrow: pip install pyarrow"
+            ) from exc
+    if suffix in ('.tsv', '.txt'):
+        return pd.read_csv(path, sep='\t')
+    return pd.read_csv(path)
+
+
+def _count_metadata_columns(pg_matrix: pd.DataFrame) -> int:
+    """Number of leading DIA-NN annotation columns before the sample columns."""
+    n = 0
+    for col in pg_matrix.columns:
+        if col not in DIANN_PG_METADATA_COLUMNS:
+            break
+        n += 1
+    if n == 0 or 'Protein.Group' not in pg_matrix.columns[:n]:
+        raise ValueError(
+            "Input does not look like a DIA-NN pg_matrix: expected leading "
+            f"annotation columns such as 'Protein.Group', found "
+            f"{list(pg_matrix.columns[:3])}. If this is a .tsv file saved with "
+            "a .csv extension, rename it to .tsv."
+        )
+    non_numeric = [
+        col for col in pg_matrix.columns[n:]
+        if not pd.api.types.is_numeric_dtype(pg_matrix[col])
+    ]
+    if non_numeric:
+        raise ValueError(
+            f"Non-numeric columns found after the {n} annotation columns: "
+            f"{non_numeric[:5]}. Expected only sample intensity columns."
+        )
+    return n
+
+
 def load_data(config) -> Tuple[pd.DataFrame, np.ndarray, List[str], pd.DataFrame]:
     """
     Load protein-level proteomics data and align samples to labels.
@@ -46,7 +105,7 @@ def load_data(config) -> Tuple[pd.DataFrame, np.ndarray, List[str], pd.DataFrame
     protein_metadata : pd.DataFrame
         Metadata for every protein row in the input matrix.
     """
-    pg_matrix = pd.read_csv(config.DATA_FILE)
+    pg_matrix = _read_matrix(config.DATA_FILE)
     group_labels = pd.read_excel(config.LABEL_FILE)
 
     # Reject peptide-level input. Each peptide from the same protein would
@@ -60,8 +119,8 @@ def load_data(config) -> Tuple[pd.DataFrame, np.ndarray, List[str], pd.DataFrame
             "for peptide-level analyses."
         )
 
-    n_metadata_cols = 6
-    print("Detected protein-level matrix (6 metadata columns)")
+    n_metadata_cols = _count_metadata_columns(pg_matrix)
+    print(f"Detected protein-level matrix ({n_metadata_cols} metadata columns)")
 
     # Filter proteins with insufficient proteotypic peptides
     min_peptides = config.MIN_PROTEOTYPIC_PEPTIDES
@@ -167,6 +226,8 @@ def _write_stable_features_csv(results, protein_metadata, output_path, timestamp
     sel_probs_map = feat_stab.get('selection_probabilities', {})
     preprocessing_info = results.get('preprocessing', {})
     imputation_rate_per_feature = preprocessing_info.get('imputation_rate_per_feature', {})
+    imputation_rate_case = preprocessing_info.get('imputation_rate_case', {})
+    imputation_rate_control = preprocessing_info.get('imputation_rate_control', {})
 
     rows = []
     for feat_idx in feat_stab['feature_frequency']:
@@ -183,6 +244,8 @@ def _write_stable_features_csv(results, protein_metadata, output_path, timestamp
             'n_case': d_entry.get('n_case', 0),
             'n_control': d_entry.get('n_control', 0),
             'imputation_rate': float(imputation_rate_per_feature.get(feat_idx, 0.0)),
+            'imputation_rate_case': float(imputation_rate_case.get(feat_idx, float('nan'))),
+            'imputation_rate_control': float(imputation_rate_control.get(feat_idx, float('nan'))),
         })
 
     df = pd.DataFrame(rows)
@@ -215,18 +278,30 @@ def _write_schema_sidecar(output_path, timestamp, config):
                 'threshold recorded in run_manifest.derived_parameters.threshold.'
             ),
             'cohens_d': (
-                "Signed Cohen's d on the preprocessed (log + z-scored + imputed) matrix: "
+                "Signed Cohen's d on observed (non-imputed) values after the missing-value "
+                "filter and optional log2 transform: "
                 f"(mean_{config.CASE_NAME} - mean_{config.CONTROL_NAME}) / pooled_std. "
-                f"Positive = higher in {config.CASE_NAME}."
+                f"Positive = higher in {config.CASE_NAME}. Imputed values are excluded, so "
+                "a protein detected mainly in one group can have a modest d despite a "
+                "large detection difference — compare imputation_rate_case / _control."
             ),
             'direction': f"'up_case' (higher in {config.CASE_NAME}), 'up_control' (higher in {config.CONTROL_NAME}), 'zero', or 'undetermined' (n<2 in a group).",
-            'n_case': f"Number of non-NaN {config.CASE_NAME} samples contributing to this feature's Cohen's d.",
-            'n_control': f"Number of non-NaN {config.CONTROL_NAME} samples contributing to this feature's Cohen's d.",
+            'n_case': f"Number of {config.CASE_NAME} samples with an observed (non-imputed) value, i.e. contributing to this feature's Cohen's d.",
+            'n_control': f"Number of {config.CONTROL_NAME} samples with an observed (non-imputed) value, i.e. contributing to this feature's Cohen's d.",
             'imputation_rate': (
                 'Fraction of samples (case + control) whose value for this feature was '
                 'imputed. Computed on the matrix after the missing-value filter but before '
                 'imputation. 0 = every observation was MS2-quantified. See '
                 'run_manifest.resolved_config.imputation_strategy for the method.'
+            ),
+            'imputation_rate_case': (
+                f'Fraction of {config.CASE_NAME} samples whose value for this feature was '
+                'imputed (same basis as imputation_rate).'
+            ),
+            'imputation_rate_control': (
+                f'Fraction of {config.CONTROL_NAME} samples whose value for this feature was '
+                'imputed (same basis as imputation_rate). A large gap between the case and '
+                'control rates means the feature may reflect detection rather than abundance.'
             ),
         },
     }
@@ -349,6 +424,11 @@ def _derive_parameters(results) -> dict:
         'pfer_target': info.get('pfer_target'),
         'pfer_bound_at_tau': info.get('pfer_bound'),
         'p_after_preprocessing': info.get('p_after_preprocessing'),
+        'mean_selected_per_subsample': info.get('mean_selected_per_subsample'),
+        'min_selected_per_subsample': info.get('min_selected_per_subsample'),
+        'max_selected_per_subsample': info.get('max_selected_per_subsample'),
+        'C_min': info.get('C_min'),
+        'C_max': info.get('C_max'),
     }
 
 
@@ -371,4 +451,5 @@ def _serialise_preprocessing(pp: dict) -> dict:
         'global_imputation_rate': global_rate,
         'log_transform': pp.get('log_transform'),
         'max_missing': pp.get('max_missing'),
+        'missing_filter': pp.get('missing_filter'),
     }

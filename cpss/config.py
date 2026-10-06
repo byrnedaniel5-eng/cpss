@@ -34,6 +34,20 @@ class Config:
         self.LOG_TRANSFORM = config_dict['log_transform']
         self.IMPUTATION_STRATEGY = config_dict['imputation_strategy']
         self.KNN_NEIGHBORS = config_dict.get('knn_neighbors', 5)
+        # 'overall': drop a protein if > max_missing of all samples are missing.
+        # 'per_group': keep it if <= max_missing are missing in at least one
+        # group (retains proteins detected mainly in one group; uses labels).
+        self.MISSING_FILTER = config_dict.get('missing_filter', 'overall')
+        if self.MISSING_FILTER not in ('overall', 'per_group'):
+            raise ValueError(
+                f"missing_filter must be 'overall' or 'per_group', "
+                f"got {self.MISSING_FILTER!r}"
+            )
+        # Left-censored ('min_prob') imputation: draws from a Gaussian
+        # centred minprob_downshift SDs below each protein's observed mean,
+        # with width minprob_width x SD (Perseus defaults).
+        self.MINPROB_DOWNSHIFT = config_dict.get('minprob_downshift', 1.8)
+        self.MINPROB_WIDTH = config_dict.get('minprob_width', 0.3)
         self.MIN_PROTEOTYPIC_PEPTIDES = config_dict.get('min_proteotypic_peptides', 2)
 
         # Upstream DIA-NN log (for database version capture, HC-INTER-03).
@@ -50,6 +64,11 @@ class Config:
         # Stability selection
         self.MAX_CANDIDATES = config_dict['max_candidates']
         self.STABILITY_ITERATIONS = config_dict['stability_iterations']
+        if self.STABILITY_ITERATIONS < 2 or self.STABILITY_ITERATIONS % 2:
+            raise ValueError(
+                "stability_iterations must be a positive even number "
+                f"(2 x B complementary pairs), got {self.STABILITY_ITERATIONS}"
+            )
         self.STABILITY_PFER = float(config_dict['stability_pfer'])
         self.N_JOBS = config_dict['n_jobs']
 

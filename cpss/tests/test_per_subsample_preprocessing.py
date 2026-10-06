@@ -51,9 +51,9 @@ def test_iteration_accepts_nan_bearing_input(base_config_dict):
     X, y = _make_signal_data(seed=0)
     assert X.isna().any().any(), "Test data must contain NaNs to be meaningful"
 
-    selected, converged = _stability_iteration_elasticnet_path(
+    selected, converged, _ = _stability_iteration_elasticnet_path(
         X, y, q=5, iteration_idx=0, random_seed=0,
-        C_ref=0.1, l1_ratio=0.5, max_iter=500, config=config,
+        l1_ratio=0.5, max_iter=500, config=config,
     )
     assert isinstance(selected, list)
     assert converged in (True, False)
@@ -86,9 +86,9 @@ def test_subsample_selection_insensitive_to_out_of_subsample_values(base_config_
     sub_mask[train_idx] = True
     out_of_sub_idx = np.where(~sub_mask)[0]
 
-    selected_a, _ = _stability_iteration_elasticnet_path(
+    selected_a, _, _ = _stability_iteration_elasticnet_path(
         X, y, q=5, iteration_idx=0, random_seed=config.RANDOM_STATE,
-        C_ref=0.1, l1_ratio=0.5, max_iter=1000, config=config,
+        l1_ratio=0.5, max_iter=1000, config=config,
     )
 
     # Inject large outliers into rows that iteration 0 will never see.
@@ -97,9 +97,9 @@ def test_subsample_selection_insensitive_to_out_of_subsample_values(base_config_
         X_perturbed.iloc[out_of_sub_idx, :] * 1000.0 + 1e6
     )
 
-    selected_b, _ = _stability_iteration_elasticnet_path(
+    selected_b, _, _ = _stability_iteration_elasticnet_path(
         X_perturbed, y, q=5, iteration_idx=0, random_seed=config.RANDOM_STATE,
-        C_ref=0.1, l1_ratio=0.5, max_iter=1000, config=config,
+        l1_ratio=0.5, max_iter=1000, config=config,
     )
 
     assert selected_a == selected_b, (
@@ -133,3 +133,29 @@ def test_full_pipeline_runs_on_nan_input(base_config_dict):
     assert isinstance(stable, list)
     assert 0.0 < threshold <= 1.0
     assert c_ref > 0.0
+
+
+def test_each_subsample_selects_q_features(base_config_dict):
+    """Each subsample walks its own C path to q non-zero coefficients, so the
+    realised selection size matches the q used for θ = q/p in the bound.
+    Regression test for v1.0.0, where a single full-cohort C over-penalised
+    half-sized subsamples and they selected far fewer than q features."""
+    cfg_dict = dict(base_config_dict)
+    cfg_dict.update({
+        'imputation_strategy': 'minimum',
+        'log_transform': False,
+        'l1_ratio': 0.3,
+        'max_iterations': 2000,
+        'random_state': 0,
+    })
+    config = Config(cfg_dict)
+
+    X, y = _make_signal_data(n_samples=60, n_features=150, n_signal=4, seed=2)
+    q = 15
+    for i in range(4):
+        selected, _, C_used = _stability_iteration_elasticnet_path(
+            X, y, q=q, iteration_idx=i, random_seed=0,
+            l1_ratio=0.3, max_iter=2000, config=config,
+        )
+        assert len(selected) == q
+        assert C_used > 0

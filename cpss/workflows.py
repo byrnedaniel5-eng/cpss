@@ -31,12 +31,6 @@ def full_dataset_stability_elasticnet(X_raw, y, config):
     preprocessor = Preprocessor(config, verbose=True)
     X_global = preprocessor.fit_transform_global(X_raw, y)
 
-    # Full-cohort local stage, used only for descriptive Cohen's d on the
-    # selected features so that reported effect sizes are computed on the
-    # same imputation basis as previous runs. Not fed into the stability
-    # iterations.
-    X_full_local = preprocessor.fit_transform_local(X_global)
-
     p = X_global.shape[1]
     k = config.MAX_CANDIDATES
     B = config.STABILITY_ITERATIONS // 2
@@ -51,16 +45,26 @@ def full_dataset_stability_elasticnet(X_raw, y, config):
 
     threshold_info['p_after_preprocessing'] = p
 
-    print(f"\n{len(stable_features)} stable features (π={threshold:.4f}, C={C_ref:.2e})")
+    print(f"\n{len(stable_features)} stable features (π={threshold:.4f}, median C={C_ref:.2e})")
 
     if not stable_features:
         print("No stable features found.")
         return None
 
-    cohens_d = calculate_cohens_d(X_full_local, y, stable_features)
+    # Descriptive Cohen's d on observed (non-imputed) values. Imputed values
+    # would distort it — a minimum fill collapses a group onto one value and
+    # inflates |d| — and n_case / n_control then count observed samples.
+    # d is scale-invariant, so skipping z-scoring changes nothing else.
+    cohens_d = calculate_cohens_d(X_global, y, stable_features)
 
     n_case = int(np.sum(y == 1))
     n_control = int(np.sum(y == 0))
+
+    # Per-group imputation rates expose detection asymmetry (e.g. a protein
+    # observed in most cases but few controls) that the pooled rate hides.
+    mask = preprocessor.missing_mask
+    imputation_rate_case = mask[y == 1].mean(axis=0).to_dict()
+    imputation_rate_control = mask[y == 0].mean(axis=0).to_dict()
 
     return {
         'n_stable': len(stable_features),
@@ -79,6 +83,7 @@ def full_dataset_stability_elasticnet(X_raw, y, config):
             'imputation_strategy': config.IMPUTATION_STRATEGY,
             'log_transform': config.LOG_TRANSFORM,
             'max_missing': config.MAX_MISSING,
+            'missing_filter': config.MISSING_FILTER,
             'n_features_initial': X_raw.shape[1],
             'n_features_after_missing_filter': len(preprocessor.features_after_missing or []),
             'n_imputed_cells_total': preprocessor.n_imputed_total,
@@ -87,6 +92,8 @@ def full_dataset_stability_elasticnet(X_raw, y, config):
                 if preprocessor.imputation_rate_per_feature is not None
                 else {}
             ),
+            'imputation_rate_case': imputation_rate_case,
+            'imputation_rate_control': imputation_rate_control,
             'features_after_missing': preprocessor.features_after_missing,
         },
         'sample_counts': {

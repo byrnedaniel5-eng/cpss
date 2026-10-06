@@ -95,3 +95,50 @@ def test_compute_rconcave_threshold_golden():
     assert tau == pytest.approx(0.52, abs=1e-9)
     assert bound == pytest.approx(4.971542343223834, abs=1e-6)
     assert mb == pytest.approx(0.7, abs=1e-9)
+
+
+# Reference values from R stabs 0.7.1 (stabs:::D, Hofner & Hothorn), an
+# independent implementation of the same Appendix A.4 algorithm. Arguments
+# are (eta, which, N, r) with t = which / N. Small differences come from the
+# two implementations' root-finding tolerances; cpss must never be lower
+# (i.e. less conservative) than stabs.
+STABS_REFERENCE = [
+    (0.01, 30, 50, -0.5, 0.00192163077349694),
+    (0.1, 30, 100, -0.25, 0.0762633068424697),
+    (0.0004, 10, 50, -0.5, 0.000394396426965593),
+    (0.05, 15, 100, -0.25, 0.0831851146409784),
+]
+
+
+@pytest.mark.parametrize("eta, which, N, r, expected", STABS_REFERENCE)
+def test_compute_D_matches_stabs(eta, which, N, r, expected):
+    value = compute_D(eta, which / N, N, r)
+    assert value == pytest.approx(expected, abs=1e-5)
+    assert value >= expected - 1e-9
+
+
+@pytest.mark.parametrize("q, p, B, pfer, expected_tau", [
+    (10, 1000, 50, 1, 0.26),
+    (20, 1000, 50, 2, 0.34),
+    (40, 1000, 100, 5, 0.405),
+])
+def test_threshold_matches_stabs(q, p, B, pfer, expected_tau):
+    """Cutoffs from stabs::stabsel_parameters(assumption = 'r-concave',
+    sampling.type = 'SS')."""
+    tau, _, _ = compute_rconcave_threshold(q=q, p=p, B=B, pfer_target=pfer)
+    assert tau == pytest.approx(expected_tau, abs=1e-9)
+
+
+def test_unreachable_pfer_target_warns():
+    with pytest.warns(RuntimeWarning, match="unreachable"):
+        tau, bound, _ = compute_rconcave_threshold(q=60, p=150, B=25, pfer_target=0.5)
+    assert tau == 1.0
+    assert bound > 0.5
+
+
+def test_odd_stability_iterations_rejected(base_config_dict):
+    from cpss.config import Config
+    cfg_dict = dict(base_config_dict)
+    cfg_dict['stability_iterations'] = 99
+    with pytest.raises(ValueError, match="even"):
+        Config(cfg_dict)

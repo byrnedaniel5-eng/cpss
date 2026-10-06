@@ -41,7 +41,7 @@ Verify the install:
 
 ```bash
 python -c "import cpss; print(cpss.__version__)"
-# 1.0.0
+# 1.1.0
 ```
 
 ### Dependencies
@@ -57,7 +57,7 @@ Two files are required:
 
 ### 1. Protein-level abundance matrix (`pg_matrix`)
 
-A CSV produced by DIA-NN. The first 6 columns are protein-level metadata (`Protein.Group`, `Protein.Ids`, `Protein.Names`, `Genes`, `First.Protein.Description`, `N.Proteotypic.Sequences`); every column from index 6 onwards is a sample, named by the run/biobank ID.
+The DIA-NN `pg_matrix` as written by DIA-NN (`.tsv`, or `.parquet` from DIA-NN 2.x — requires `pyarrow`), or re-saved as `.csv`; the parser is chosen from the file extension. The leading protein-level annotation columns (`Protein.Group`, `Protein.Ids`, `Protein.Names`, `Genes`, `First.Protein.Description`, and in DIA-NN 1.9+ `N.Sequences` / `N.Proteotypic.Sequences`) are detected by name, so layouts from different DIA-NN versions are handled; every column after them is a sample, named by the run/biobank ID.
 
 Peptide-level matrices (`pr_matrix`, detectable by a `Stripped.Sequence` column) are rejected at load time — see the docstring on [io.py](cpss/io.py) for why.
 
@@ -90,7 +90,8 @@ The most important keys:
 | `group_column`, `sample_id_column` | Column names in the label file |
 | `min_proteotypic_peptides` | Drops proteins with `N.Proteotypic.Sequences` below this (default 2) |
 | `max_missing` | Per-protein NaN fraction allowed after sample alignment |
-| `imputation_strategy` | `knn`, `minimum`, `mean`, or `median` |
+| `missing_filter` | `overall` (default: `max_missing` applied across all samples) or `per_group` (keep a protein that passes in at least one group — retains proteins detected mainly in cases or controls; uses the labels once, before stability selection) |
+| `imputation_strategy` | `knn`, `minimum`, `min_prob`, `mean`, or `median`, refit inside each subsample. `min_prob` draws left-censored values (`minprob_downshift` SDs below each protein's observed mean, width `minprob_width` × SD; defaults 1.8 and 0.3) for below-detection missingness |
 | `log_transform` | Apply log2(x+1) before scaling |
 | `max_candidates` (q) | Number of top-|β| coefficients retained per subsample |
 | `stability_iterations` | 2 × B; **S&S §3.4.1 recommends B ≤ 50** so leave at 100 unless you understand the r-concavity assumption |
@@ -110,7 +111,7 @@ From the directory containing your config (and data files referenced by it):
 python -m cpss --config config_cpss.yaml
 ```
 
-This prints class balance, q/p, B, the r-concave vs M&B threshold comparison, calibrated `C_ref`, the top-20 stable features by selection probability π̂, and writes results to `output_dir`. Relative paths in the config are resolved from the current working directory.
+This prints class balance, q/p, B, the r-concave vs M&B threshold comparison, the realised number of features selected per subsample and the per-subsample C range, the top-20 stable features by selection probability π̂, and writes results to `output_dir`. Relative paths in the config are resolved from the current working directory.
 
 ---
 
@@ -225,10 +226,10 @@ If the install is healthy you should see most of the first 10 injected proteins 
 
 | File | Contents |
 | --- | --- |
-| `stable_features_<ts>.csv` | One row per *measured* protein with `selection_probability`, `cohens_d`, `direction`, `n_case`, `n_control`, `imputation_rate`. Sorted by π̂. The "stable" subset is everything with π̂ ≥ threshold (recorded in the manifest). |
+| `stable_features_<ts>.csv` | One row per *stable* protein (π̂ ≥ threshold, recorded in the manifest) with `selection_probability`, `cohens_d`, `direction`, `n_case`, `n_control`, `imputation_rate`, `imputation_rate_case`, `imputation_rate_control`. Sorted by π̂. Cohen's d and `n_case` / `n_control` use observed (non-imputed) values only; a large gap between the per-group imputation rates flags a protein that may reflect detection rather than abundance. Selection probabilities for every protein are in the pickle. |
 | `stable_features_<ts>.schema.json` | Per-column descriptions for the CSV. |
 | `full_results_<ts>.pkl` | Pickled `results` dict (feature_stability, stability_selection, preprocessing, sample_counts). |
-| `run_manifest_<ts>.json` | Reproducibility manifest: package + dependency versions, input SHA-256 hashes, upstream DIA-NN log provenance, resolved config, derived parameters (`C_ref`, threshold, M&B threshold, θ, B, PFER), preprocessing summary, convergence stats. |
+| `run_manifest_<ts>.json` | Reproducibility manifest: package + dependency versions, input SHA-256 hashes, upstream DIA-NN log provenance, resolved config, derived parameters (median and range of per-subsample C, realised features per subsample, threshold, M&B threshold, θ, B, PFER), preprocessing summary, convergence stats. |
 
 `create_visualizations` additionally writes selection-probability and threshold-comparison plots to the same directory.
 
@@ -254,9 +255,9 @@ create_visualizations(results, protein_metadata, config)
 Lower-level entry points exposed at the package root:
 
 - `Preprocessor(config).fit_transform(X, y)` — leakage-safe missing-filter + log + impute + z-score; reusable on held-out data via `.transform`.
-- `stability_selection_elasticnet(X, y, config)` — returns `(stable_features, threshold, selection_probs, C_ref, threshold_info)`.
+- `stability_selection_elasticnet(X, y, config)` — returns `(stable_features, threshold, selection_probs, C_ref, threshold_info)`, where `C_ref` is the median of the per-subsample C values (the full range and the realised selection sizes are in `threshold_info`).
 - `compute_rconcave_threshold(q, p, B, pfer)` and `compute_D(...)` — the threshold maths in isolation.
-- `calculate_cohens_d(X, y, features)` — signed effect size on the preprocessed matrix.
+- `calculate_cohens_d(X, y, features)` — signed effect size per feature, ignoring NaNs (the pipeline passes the non-imputed, post-log matrix).
 
 ---
 
@@ -267,13 +268,13 @@ pytest cpss/tests          # fast suite
 pytest cpss/tests --runslow  # includes the empirical PFER calibration test
 ```
 
-The suite covers the r-concave bound (`test_rconcave.py`), an empirical PFER check (`test_pfer_empirical.py`), Cohen's d edge cases, peptide-input rejection, preprocessing leakage guarantees, and the end-to-end CSV/manifest schema.
+The suite covers the r-concave bound (`test_rconcave.py`), an empirical PFER check (`test_pfer_empirical.py`), Cohen's d edge cases, peptide-input rejection, DIA-NN input formats and layouts, preprocessing leakage guarantees, and the end-to-end CSV/manifest schema.
 
 ---
 
 ## Theory — one paragraph
 
-For each subsample the procedure fits an ElasticNet logistic regression at a fixed regularisation `C_ref` (calibrated once on the full data so each subsample yields ≤ q non-zero coefficients), then records the top-q features by |β|. With B complementary pairs (2B subsamples) the selection probability π̂ for each feature is the empirical proportion of subsamples in which it appeared. A feature is called stable when π̂ ≥ π, where π is the smallest threshold for which the **r-concave bound** (Shah & Samworth 2013, eq. 8)
+For each subsample the procedure walks an ElasticNet logistic regression up a grid of C values until at least q coefficients are non-zero, then records the top-q features by |β| — the analogue of taking the first q variables to enter the regularisation path. Each subsample therefore selects q features, so the realised selection size matches θ = q/p in the bound, and the selector depends only on its own subsample. With B complementary pairs (2B subsamples) the selection probability π̂ for each feature is the empirical proportion of subsamples in which it appeared. A feature is called stable when π̂ ≥ π, where π is the smallest threshold for which the **r-concave bound** (Shah & Samworth 2013, eq. 8)
 
 > E[V] ≤ min{ D(θ², 2τ-1, B, -½),  D(θ, τ, 2B, -¼) } × p
 
@@ -290,11 +291,11 @@ is below the user-specified PFER budget. θ = q/p is data-dependent and so π mu
 | Threshold | Analytical: Shah & Samworth (2013) r-concave bound for a user-specified PFER | Empirical: permuted or knockoff copies of the features are appended and the threshold minimising an estimated false-discovery proportion (FDP⁺) is chosen |
 | Error quantity | Expected number of false positives, E[V] | Estimated false-discovery proportion |
 | Subsampling | Complementary pairs, B ≤ 50 (required for the bound) | Bootstrap, typically 1000 draws |
-| Regularisation | Single C_ref, calibrated once so ≤ q coefficients survive | Sweep over a λ grid; selection frequency is the maximum across the grid |
+| Regularisation | Per subsample, the point on the C path where q features have entered; one selected set per subsample | Sweep over a λ grid; selection frequency is the maximum across the grid |
 | Preprocessing | Imputation and scaling refit inside every subsample | Expects a preprocessed matrix |
 | Scope | Binary classification on DIA-NN `pg_matrix` output | Multi-omics, regression, multi-class, late fusion |
 
-Taking the maximum selection frequency over a regularisation path places Stabl outside the assumptions of the Shah & Samworth bound, which is why it calibrates the threshold against synthetic null features instead. cpss keeps a fixed regularisation strength and complementary-pairs subsampling so that the analytical bound applies, at the cost of generality. Where a permuted-feature null is used, note that independently shuffled columns lose their correlation with every measured protein and so are more easily separated from signal than genuine uninformative proteins in a correlated proteome; the threshold derived from them is not guaranteed to control the false-discovery proportion among real features.
+Taking the maximum selection frequency over a regularisation path places Stabl outside the assumptions of the Shah & Samworth bound, which is why it calibrates the threshold against synthetic null features instead. cpss produces a single selected set of size q per subsample and uses complementary-pairs subsampling so that the analytical bound applies, at the cost of generality. Where a permuted-feature null is used, note that independently shuffled columns lose their correlation with every measured protein and so are more easily separated from signal than genuine uninformative proteins in a correlated proteome; the threshold derived from them is not guaranteed to control the false-discovery proportion among real features.
 
 In practice the two methods rank features very similarly on the same data and differ mainly in where the inclusion cut-off falls. Choose Stabl for flexibility across data types and tasks; choose cpss when you want the retained set to carry a stated, interpretable bound on the expected number of false positives.
 

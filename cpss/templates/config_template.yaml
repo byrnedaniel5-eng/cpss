@@ -9,7 +9,8 @@
 # command from (not relative to this file).
 
 # ── Required: input data ────────────────────────────────────────────────
-# Path to the protein-level DIA-NN matrix (pg_matrix CSV). Peptide-level
+# Path to the protein-level DIA-NN matrix (pg_matrix .tsv, .parquet or
+# .csv; the parser is chosen from the extension). Peptide-level
 # matrices (pr_matrix) are rejected at load time.
 data_file: 'output.pg_matrix.csv'
 
@@ -39,12 +40,25 @@ random_state: 42
 # 0.0 = require complete cases.
 max_missing: 0.0
 
+# How max_missing is applied: "overall" (across all samples) or "per_group"
+# (keep a protein that passes in at least one group). In untargeted data,
+# missingness is often below-detection, so "per_group" with e.g.
+# max_missing: 0.3 retains proteins present mainly in cases or controls.
+# Note "per_group" uses the labels once, before stability selection.
+missing_filter: "overall"
+
 # Apply log2(x+1) before z-scoring. Recommended for raw DIA-NN intensities.
 log_transform: true
 
-# Imputation strategy: "knn", "minimum", "mean", or "median".
+# Imputation strategy: "knn", "minimum", "min_prob", "mean", or "median".
+# All are refit inside each subsample. "min_prob" draws left-censored values
+# (Perseus-style: minprob_downshift SDs below each protein's observed mean,
+# width minprob_width x SD) and suits below-detection missingness; "knn",
+# "mean" and "median" assume values are missing at random.
 imputation_strategy: "knn"
 knn_neighbors: 5
+# minprob_downshift: 1.8
+# minprob_width: 0.3
 
 # Drop proteins with N.Proteotypic.Sequences below this. DIA-NN's column.
 min_proteotypic_peptides: 2

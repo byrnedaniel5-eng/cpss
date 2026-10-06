@@ -11,6 +11,8 @@ This is the tighter bound that is the main contribution of Shah & Samworth
 over the Meinshausen & Buhlmann (2010) worst-case bound.
 """
 
+import warnings
+
 import numpy as np
 from scipy.optimize import brentq, minimize_scalar
 from scipy.special import logsumexp
@@ -258,10 +260,19 @@ def compute_rconcave_threshold(q, p, B, pfer_target):
             best_bound = bound
             break
 
+    if best_bound > pfer_target:
+        warnings.warn(
+            f"PFER target {pfer_target} is unreachable for q={q}, p={p}, B={B}: "
+            f"even at tau=1 the r-concave bound is {best_bound:.3f}. Returning "
+            f"tau=1.0; reduce q (max_candidates) or raise stability_pfer.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     return best_tau, best_bound, mb_threshold
 
 
-def print_threshold_comparison(q, p, B, pfer_target):
+def print_threshold_comparison(q, p, B, pfer_target, result=None):
     """
     Compute and print a comparison of the M&B and r-concave thresholds.
 
@@ -275,9 +286,14 @@ def print_threshold_comparison(q, p, B, pfer_target):
         Number of complementary pairs
     pfer_target : float
         Target PFER
+    result : tuple, optional
+        The (tau, bound, mb_threshold) already returned by
+        compute_rconcave_threshold for these arguments, to avoid recomputing.
     """
     theta = q / p
-    tau_rc, bound_rc, tau_mb = compute_rconcave_threshold(q, p, B, pfer_target)
+    if result is None:
+        result = compute_rconcave_threshold(q, p, B, pfer_target)
+    tau_rc, bound_rc, tau_mb = result
 
     print(f"\n    Shah & Samworth (2013) threshold comparison")
     print(f"    {'─' * 50}")

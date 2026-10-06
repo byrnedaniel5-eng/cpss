@@ -21,15 +21,15 @@ from .rconcave import compute_rconcave_threshold, print_threshold_comparison
 
 # Design notes
 # ------------
-# 1. C_ref calibration. C_ref is calibrated once on the FULL globally-
-#    preprocessed training set (with a one-shot local stage fit) and reused
-#    across every complementary-pairs subsample. This is the Shah & Samworth
-#    (2013) design — regularisation is treated as a fixed hyperparameter of
-#    the stability procedure, not something re-tuned per subsample. It is
-#    not a cross-validation leakage bug: stability selection does not
-#    evaluate model performance on held-out data; it counts how often each
-#    feature is selected across subsamples at a fixed regularisation
-#    strength.
+# 1. Per-subsample regularisation. Each complementary-pairs subsample walks
+#    up its own C grid until at least q coefficients are non-zero, then keeps
+#    the top q by |β| — the analogue of stabs' "first q variables to enter
+#    the path". Every subsample therefore selects (up to) q features, so the
+#    realised E|S_b| matches the θ = q/p used in the r-concave bound, and the
+#    selector is a function of its own subsample only. (Up to v1.0.0 a single
+#    C was calibrated on the full cohort; because sklearn's C scales with n,
+#    half-sized subsamples were over-penalised and typically selected far
+#    fewer than q features, making the threshold needlessly conservative.)
 # 2. Per-subsample local preprocessing. Imputation and scaling ARE refit
 #    inside each subsample. Fitting them globally would let one subsample's
 #    imputed values depend on rows in the complementary subsample, breaking
@@ -61,7 +61,7 @@ def _sklearn_ge(major: int, minor: int) -> bool:
 _PENALTY_KWARG_REQUIRED = not _sklearn_ge(1, 8)
 
 
-def _elasticnet_logreg(C, l1_ratio, random_state, max_iter):
+def _elasticnet_logreg(C, l1_ratio, random_state, max_iter, warm_start=False):
     """LogisticRegression configured for elastic net, across sklearn versions."""
     kwargs = dict(
         C=C,
@@ -69,35 +69,56 @@ def _elasticnet_logreg(C, l1_ratio, random_state, max_iter):
         solver='saga',
         random_state=random_state,
         max_iter=max_iter,
+        warm_start=warm_start,
     )
     if _PENALTY_KWARG_REQUIRED:
         kwargs['penalty'] = 'elasticnet'
     return LogisticRegression(**kwargs)
 
 
-def _find_elasticnet_C_for_q(X, y, q, random_state, l1_ratio, max_iter=1000):
-    """Largest ElasticNet C (in a log-spaced sweep) that keeps <= q non-zero coefs."""
-    Cs = np.logspace(-4, 2, 50)
-    C_ref = Cs[0]
-    for C in Cs:
-        model = _elasticnet_logreg(C, l1_ratio, random_state, max_iter)
-        model.fit(X, y)
-        n_nonzero = int(np.sum(model.coef_[0] != 0))
-        if n_nonzero <= q:
-            C_ref = C
-    return C_ref
+# C grid walked by every subsample (ascending = decreasing penalty).
+_C_GRID = np.logspace(-4, 2, 50)
+
+# Coefficients at or below this magnitude are treated as zero.
+_NONZERO_TOL = 1e-6
+
+
+def _select_top_q_on_path(X, y, q, l1_ratio, random_state, max_iter):
+    """Walk up the C grid until at least q coefficients are non-zero, and
+    return the top q features by |β| at that point.
+
+    Returns (selected_column_positions, converged, C_used). If the path never
+    reaches q non-zero coefficients, all non-zero features at the largest C
+    are returned.
+    """
+    model = _elasticnet_logreg(
+        _C_GRID[0], l1_ratio, random_state, max_iter, warm_start=True
+    )
+    for C in _C_GRID:
+        model.set_params(C=C)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ConvergenceWarning)
+            model.fit(X, y)
+        converged = not any(issubclass(w.category, ConvergenceWarning) for w in caught)
+        coefs = np.abs(model.coef_[0])
+        nonzero_idx = np.where(coefs > _NONZERO_TOL)[0]
+        if len(nonzero_idx) >= q:
+            break
+    top_q_idx = nonzero_idx[np.argsort(coefs[nonzero_idx])[::-1][:q]]
+    return top_q_idx, converged, float(C)
 
 
 def _stability_iteration_elasticnet_path(
-    X_global, y, q, iteration_idx, random_seed, C_ref, l1_ratio, max_iter, config
+    X_global, y, q, iteration_idx, random_seed, l1_ratio, max_iter, config
 ):
     """Single complementary-pairs iteration with per-subsample local
-    preprocessing (imputation + scaling refit on the subsample only).
+    preprocessing (imputation + scaling refit on the subsample only) and
+    per-subsample regularisation (see design note 1).
 
     ``X_global`` is expected to be the post-missing-filter, post-log matrix
     with NaNs preserved.
 
-    Returns (selected_features, converged).
+    Returns (selected_features, converged, C_used).
     """
     # Complementary pairs: (2i, 2i+1) share the split seed
     splitter = StratifiedShuffleSplit(
@@ -111,25 +132,15 @@ def _stability_iteration_elasticnet_path(
     X_sub_raw = X_global.iloc[subsample_indices]
     y_sub = y[subsample_indices]
 
-    # Fit a fresh local preprocessor (imputer + scaler) on this subsample.
-    sub_pp = Preprocessor(config, verbose=False)
+    # Fit a fresh local preprocessor (imputer + scaler) on this subsample,
+    # seeded per subsample so 'min_prob' draws differ across subsamples.
+    sub_pp = Preprocessor(config, verbose=False, seed=random_seed + iteration_idx)
     X_sub = sub_pp.fit_transform_local(X_sub_raw)
 
-    model = _elasticnet_logreg(
-        C_ref, l1_ratio, random_seed + iteration_idx, max_iter
+    top_q_idx, converged, C_used = _select_top_q_on_path(
+        X_sub, y_sub, q, l1_ratio, random_seed + iteration_idx, max_iter
     )
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", ConvergenceWarning)
-        model.fit(X_sub, y_sub)
-        converged = not any(issubclass(w.category, ConvergenceWarning) for w in caught)
-
-    coefs = np.abs(model.coef_[0])
-    nonzero_idx = np.where(coefs > 1e-6)[0]
-    if len(nonzero_idx) == 0:
-        return [], converged
-    top_q_idx = nonzero_idx[np.argsort(coefs[nonzero_idx])[::-1][:q]]
-    return X_sub.columns[top_q_idx].tolist(), converged
+    return X_sub.columns[top_q_idx].tolist(), converged, C_used
 
 
 def stability_selection_elasticnet(
@@ -152,10 +163,18 @@ def stability_selection_elasticnet(
     threshold : float (r-concave PFER-derived selection probability)
     selection_probs : dict[str, float]
     C_ref : float
-    threshold_info : dict with rconcave/MB comparison and convergence stats
+        Median of the per-subsample C values (see design note 1). Kept in
+        this position for backward compatibility; the full distribution is
+        in ``threshold_info``.
+    threshold_info : dict with rconcave/MB comparison, realised selection
+        sizes, per-subsample C summary and convergence stats
     """
     q = q or config.MAX_CANDIDATES
     n_iterations = n_iterations or config.STABILITY_ITERATIONS
+    if n_iterations < 2 or n_iterations % 2:
+        raise ValueError(
+            f"n_iterations must be a positive even number (2 x B), got {n_iterations}"
+        )
     n_jobs = n_jobs or config.N_JOBS
     l1_ratio = config.L1_RATIO
 
@@ -168,7 +187,7 @@ def stability_selection_elasticnet(
     threshold, bound_at_tau, mb_threshold = compute_rconcave_threshold(q, p, B, pfer)
     threshold = min(threshold, 1.0)
 
-    print_threshold_comparison(q, p, B, pfer)
+    print_threshold_comparison(q, p, B, pfer, result=(threshold, bound_at_tau, mb_threshold))
 
     threshold_info = {
         'rconcave_threshold': threshold,
@@ -180,30 +199,41 @@ def stability_selection_elasticnet(
         'B': B,
     }
 
-    # Calibrate C on a full-cohort local-stage fit. This is a hyperparameter
-    # selection step (see design note 1); the per-iteration fits below use
-    # subsample-only local stages.
-    print(f"    Calibrating ElasticNet regularisation from path (l1_ratio={l1_ratio})...")
-    cref_pp = Preprocessor(config, verbose=False)
-    X_for_cref = cref_pp.fit_transform_local(X)
-    C_ref = _find_elasticnet_C_for_q(
-        X_for_cref, y, q, config.RANDOM_STATE, l1_ratio, config.MAX_ITERATIONS
-    )
-    print(f"    C_ref={C_ref:.2e}  |  r-concave threshold: π={threshold:.4f}  |  PFER≤{pfer:.1f}")
-    print(f"    Running {n_iterations} complementary-pairs iterations (n_jobs={n_jobs})...")
+    print(f"    Running {n_iterations} complementary-pairs iterations "
+          f"(l1_ratio={l1_ratio}, n_jobs={n_jobs})...")
 
     iteration_results = Parallel(n_jobs=n_jobs, verbose=0)(
         delayed(_stability_iteration_elasticnet_path)(
-            X, y, q, i, config.RANDOM_STATE, C_ref, l1_ratio, config.MAX_ITERATIONS, config
+            X, y, q, i, config.RANDOM_STATE, l1_ratio, config.MAX_ITERATIONS, config
         )
         for i in range(n_iterations)
     )
 
-    all_selected = [features for features, _ in iteration_results]
-    n_non_converged = sum(1 for _, converged in iteration_results if not converged)
+    all_selected = [features for features, _, _ in iteration_results]
+    n_non_converged = sum(1 for _, converged, _ in iteration_results if not converged)
+    C_values = np.array([C for _, _, C in iteration_results])
+    C_ref = float(np.median(C_values))
+    n_selected = np.array([len(features) for features in all_selected])
     threshold_info['n_iterations'] = n_iterations
     threshold_info['n_non_converged'] = n_non_converged
     threshold_info['non_convergence_rate'] = n_non_converged / n_iterations
+    threshold_info['mean_selected_per_subsample'] = float(n_selected.mean())
+    threshold_info['min_selected_per_subsample'] = int(n_selected.min())
+    threshold_info['max_selected_per_subsample'] = int(n_selected.max())
+    threshold_info['C_median'] = C_ref
+    threshold_info['C_min'] = float(C_values.min())
+    threshold_info['C_max'] = float(C_values.max())
+
+    print(
+        f"    Selected per subsample: mean {n_selected.mean():.1f} "
+        f"(range {n_selected.min()}–{n_selected.max()}, q={q})  |  "
+        f"C median {C_ref:.2e} (range {C_values.min():.2e}–{C_values.max():.2e})"
+    )
+    if n_selected.mean() < q:
+        print(
+            f"    NOTE: some subsamples never reached q={q} non-zero coefficients "
+            f"on the C grid. The PFER bound remains valid but is conservative."
+        )
 
     if n_non_converged / n_iterations > 0.05:
         print(
